@@ -21,6 +21,7 @@ pm25_ (target lags), pol_ (other pollutants), miss_ (missingness), nbr_
 (neighbouring stations), met_ (meteorology), fire_ (fire hotspots), cal_
 (calendar), loc_ (location) and fut_ (future weather, excluded by default).
 """
+import gc
 import glob
 import os
 import sys
@@ -388,11 +389,15 @@ def add_features(df, obs_pm25, weather=None, fires=None):
     out["PM2.5_obs"] = obs_pm25.astype(F32)
 
     # ---------------- external merges -------------------------------
+    # Left-join by looking up only the key columns and attaching the new columns
+    # one by one. DataFrame.merge would copy the whole ~140-column table (2.5 M
+    # rows) for each merge, which runs out of memory on a 16 GB laptop.
     if weather is not None:
-        out = out.merge(weather, on=["City", "Datetime"], how="left")
+        _attach(out, weather, ["City", "Datetime"], out[["City", "Datetime"]])
     if fires is not None:
-        out["date"] = out["Datetime"].dt.normalize().astype("datetime64[ns]")
-        out = out.merge(fires, on=["City", "date"], how="left").drop(columns="date")
+        keys = pd.DataFrame({"City": out["City"],
+                             "date": out["Datetime"].dt.normalize().astype("datetime64[ns]")})
+        _attach(out, fires, ["City", "date"], keys)
 
     # ---------------- targets (from un-imputed observations) ---------
     out["target"] = out.groupby("StationId", sort=False)["PM2.5_obs"].shift(-HORIZON)
@@ -400,6 +405,22 @@ def add_features(df, obs_pm25, weather=None, fires=None):
     out.loc[out["target"].isna(), "target_poor"] = np.nan
     print(f"  all features built ({time.time() - t0:.0f}s)")
     return out
+
+
+def _attach(out, ext, on, keys):
+    """In-place left join of `ext` onto `out` (row order kept) matching `keys`
+    against `ext[on]`. Raises if `ext` has duplicate keys, like a many-to-one
+    merge should."""
+    ext = ext.set_index(on)
+    if not ext.index.is_unique:
+        raise ValueError(f"duplicate keys in external data on {on}")
+    pos = ext.index.get_indexer(pd.MultiIndex.from_frame(keys[on]))
+    hit = pos >= 0
+    for c in ext.columns:
+        src = ext[c].to_numpy()
+        col = np.full(len(out), np.nan, dtype=F32 if src.dtype.kind == "f" else "float64")
+        col[hit] = src[pos[hit]]
+        out[c] = col
 
 
 def feature_columns(df, include_future=False):
@@ -438,6 +459,8 @@ def build_dataset(impute_method="ffill", with_external=True, verbose=True):
     weather = load_weather() if with_external else None
     fires = load_fires(weather) if with_external else None
     out = add_features(df, obs_pm25, weather, fires)
+    del df, obs_pm25, weather, fires                  # free memory before the row filter
+    gc.collect()
     # keep rows where a forecast can be issued (some PM2.5 history at t) and a
     # label exists
     out = out[out["target"].notna() & out["pm25_lag0"].notna()].reset_index(drop=True)
